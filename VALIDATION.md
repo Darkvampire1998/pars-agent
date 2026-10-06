@@ -11,7 +11,7 @@ Executed in Python 3.12 on Linux:
 - Docker Compose YAML parsed successfully.
 - Installer rejection tests passed: invalid hostname/repository/branch/path and refusal to overwrite an existing directory.
 - Update script rejects a directory that is not an installed Git checkout.
-- The initial GitHub Actions run on commit c7bfafe succeeded, including Docker build. The updated workflow additionally validates domain/IP Caddy settings and the host-network build overlay; its new run is pending publication.
+- GitHub Actions on commit a93249e succeeded: all Python/frontend/shell checks, Docker build, domain/IP Caddy validation, Compose configuration and the host-network build overlay. Verified run: https://github.com/Darkvampire1998/pars-agent/actions/runs/37404415839
 - Configuration helper: invalid domains rejected; 32-byte random encryption key; file mode 0600; live disabled by default; existing key cannot be overwritten.
 - IP/port configuration: public IPv4/IPv6 accepted; private/reserved/multicast/invalid addresses and invalid ports rejected. Address migration retains the encryption key, previously encrypted Telegram data, operator settings and trading/registration policies.
 - Failed-install resume rejects an unrelated repository before dependency installation. Existing directories are retained.

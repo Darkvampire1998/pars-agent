@@ -80,7 +80,6 @@ install_options+=(--port "$port")
 [[ "$repository" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || fail "Repository must be owner/name."
 [[ "$branch" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || fail "Invalid branch."
 [[ "$install_dir" == /* && "$install_dir" != / && ! "$install_dir" =~ (^|/)\.\.(/|$) ]] || fail "Installation directory must be an absolute path without parent traversal."
-[[ $EUID -eq 0 ]] || fail "Run the installer with sudo."
 if [[ -e "$install_dir" ]]; then
   [[ "$resume" == true && ! -L "$install_dir" && -d "$install_dir/.git" ]] || fail "Directory already exists: $install_dir. Use --resume only for a failed Git installation."
   command -v git >/dev/null || fail "Git is required to verify the existing checkout before resuming."
@@ -90,6 +89,7 @@ if [[ -e "$install_dir" ]]; then
 elif [[ "$resume" == true ]]; then
   fail "Cannot resume: installation directory does not exist."
 fi
+[[ $EUID -eq 0 ]] || fail "Run the installer with sudo."
 [[ -r /etc/os-release ]] || fail "Cannot detect the operating system."
 # shellcheck source=/dev/null
 source /etc/os-release

@@ -1,0 +1,9 @@
+{$DOMAIN} {
+    encode zstd gzip
+    request_body {
+        max_size 400KB
+    }
+    reverse_proxy app:8000 {
+        header_up X-Pars-Client-IP {remote_host}
+    }
+}

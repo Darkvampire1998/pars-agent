@@ -1,0 +1,12 @@
+.env
+.venv
+data
+backups
+tests
+__pycache__
+.pytest_cache
+*.pyc
+*.zip
+.git
+.github
+node_modules

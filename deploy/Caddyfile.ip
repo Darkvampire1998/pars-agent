@@ -1,4 +1,15 @@
+{
+	default_sni {$DOMAIN}
+}
+
 https://{$PANEL_HOST} {
+	tls {
+		issuer acme {
+			dir https://acme-v02.api.letsencrypt.org/directory
+			profile shortlived
+			disable_tlsalpn_challenge
+		}
+	}
 	encode zstd gzip
 	request_body {
 		max_size 400KB

@@ -1,0 +1,9 @@
+# Explicit Linux build-only workaround for broken bridge DNS.
+# Runtime services remain on the isolated Compose network.
+services:
+  app:
+    build:
+      context: .
+      network: host
+      entitlements:
+        - network.host

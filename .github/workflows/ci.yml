@@ -8,11 +8,11 @@ jobs:
   tests:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: "22"
       - run: python -m pip install -r requirements-dev.txt
@@ -20,5 +20,14 @@ jobs:
       - run: node --check app/static/app.js
       - run: npm install --no-save --package-lock=false jsdom
       - run: node tests/frontend.cjs
-      - run: bash -n deploy/bootstrap.sh deploy/install.sh deploy/update.sh deploy/backup.sh
+      - run: bash -n deploy/bootstrap.sh deploy/install.sh deploy/update.sh deploy/backup.sh deploy/manage.sh
       - run: docker build -t pars-agent:ci .
+      - name: Validate domain and IP deployment configurations
+        run: |
+          python deploy/configure.py --ip 8.8.8.8 --port 8443 --host-build-network
+          docker compose config --quiet
+          docker compose run --rm --no-deps caddy caddy validate --config /etc/caddy/Caddyfile
+          docker compose build app
+          python deploy/configure.py --domain trade.example.com --reconfigure
+          docker compose config --quiet
+          docker compose run --rm --no-deps caddy caddy validate --config /etc/caddy/Caddyfile

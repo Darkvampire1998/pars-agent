@@ -18,16 +18,18 @@ services:
         max-size: "10m"
         max-file: "3"
   caddy:
-    image: caddy:2-alpine
+    image: caddy:2.11.7-alpine
     restart: unless-stopped
     environment:
       DOMAIN: ${DOMAIN:?Run deploy/configure.py first}
+      PANEL_HOST: ${PANEL_HOST:-${DOMAIN}}
+      PUBLIC_URL: ${PUBLIC_URL:?Run deploy/configure.py first}
     ports:
       - "80:80"
-      - "443:443"
-      - "443:443/udp"
+      - "${PANEL_PORT:-443}:443"
+      - "${PANEL_PORT:-443}:443/udp"
     volumes:
-      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${CADDY_CONFIG:-./deploy/Caddyfile}:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
     depends_on:

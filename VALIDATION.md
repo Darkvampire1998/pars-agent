@@ -31,3 +31,12 @@ Not executed in this environment:
 - Strategy profitability backtests, load tests or public-service security/operations review.
 
 The source implements these paths where described in README; unexecuted integrations must be validated on the intended deployment. Software tests do not establish investment performance or production approval.
+
+## Easy installation update — 2026-10-08
+
+- Default VPS installation downloads a revision-matched GHCR image and pins the registry digest; Python packages are installed by CI, not on the VPS. Source builds remain explicit.
+- Failed clean installations resume automatically, preserving secrets/data. Already installed dependencies skip apt. An active panel is not silently upgraded.
+- Network probes have a process deadline; Telegram is optional for panel installation. Required certificate/download failures still stop installation.
+- Image/source configuration, optional network failures, stalled DNS, image revision mismatch, download failures and HTTPS failure paths are covered by deployment tests.
+- CI additionally validates that the ready-image Compose configuration has no build declaration and publishes amd64/arm64 images only after the test job succeeds.
+- VPS deployment, certificate issuance on the user's IP, MetaEditor compilation and broker execution remain unverified.

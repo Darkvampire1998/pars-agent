@@ -15,11 +15,12 @@ branch="main"
 usage() {
   cat <<'HELP'
 Pars Agent Linux installer
-Usage: sudo bash bootstrap.sh (--domain HOST | --ip PUBLIC_IP) [--port 443]
+Usage: sudo bash bootstrap.sh [--domain HOST | --ip PUBLIC_IP] [--port 443]
        [--resume] [--source-build|--host-build-network] [--repo owner/repo] [--dir /opt/pars-agent] [--branch main]
 
 Installs missing dependencies only. Downloads the ready container from GHCR;
 Python packages are already installed in the image. Starts the HTTPS panel.
+Without --ip/--domain, detects this VPS public IPv4 automatically.
 Existing unrelated directories are refused. MT5/Wine is configured separately.
 Failed installations in clean matching checkouts resume automatically, preserving .env.
 Running installations must be updated with deploy/update.sh.
@@ -50,11 +51,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ -z "$domain" || -z "$ip" ]] || fail "Choose --domain or --ip, not both."
-[[ -n "$domain" || -n "$ip" ]] || fail "Use a DNS hostname with --domain or public IP with --ip."
 if [[ -n "$domain" ]]; then
   [[ "$domain" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ && ${#domain} -le 253 ]] || fail "Use a DNS hostname without https://, port or path."
   install_options+=(--domain "$domain")
-else
+elif [[ -n "$ip" ]]; then
   [[ "$ip" =~ ^[0-9a-fA-F:.]+$ ]] || fail "Use a public IP address without scheme, port or path."
   if [[ "$ip" != *:* ]]; then
     [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "Use a public IP address."
@@ -100,7 +100,7 @@ suite="${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}"
 [[ "$suite" =~ ^[a-z]+$ ]] || fail "Cannot identify the OS release codename."
 command -v apt-get >/dev/null || fail "apt-get is required."
 
-printf 'Installing panel dependencies for %s; repository %s.\n' "${domain:-$ip}" "$repository"
+printf 'Installing panel dependencies; repository %s.\n' "$repository"
 missing=()
 for dependency in curl git python3; do
   command -v "$dependency" >/dev/null || missing+=("$dependency")
@@ -111,6 +111,18 @@ if [[ ${#missing[@]} -gt 0 ]]; then
   apt-get install -y "${missing[@]}"
 else
   printf 'Dependencies already installed; skipping apt update/install.\n'
+fi
+if [[ -z "$domain" && -z "$ip" ]]; then
+  # Bootstrap is downloadable on its own; fetch the detector from the same repo/ref.
+  detector="$(mktemp)"
+  trap 'rm -f -- "$detector"' EXIT
+  curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --connect-timeout 5 --max-time 30 \
+    "https://raw.githubusercontent.com/$repository/$branch/deploy/detect-ip.py" -o "$detector"
+  ip="$(python3 "$detector")" || fail 'Automatic IP detection failed; use --ip YOUR_PUBLIC_IP.'
+  install_options+=(--ip "$ip")
+  printf 'Detected this VPS public IP: %s\n' "$ip"
+  rm -f -- "$detector"
+  trap - EXIT
 fi
 if ! command -v docker >/dev/null; then
   install -d -m 0755 /etc/apt/keyrings

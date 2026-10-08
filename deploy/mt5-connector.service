@@ -1,0 +1,18 @@
+[Unit]
+Description=Pars Agent MT5 password connector in isolated Wine
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mt5
+Environment=WINEPREFIX=/home/mt5/.wine-pars
+WorkingDirectory=/home/mt5/pars-connector
+ExecStart=/bin/bash /opt/pars-agent/mt5/run-wine.sh /home/mt5/.wine-pars/drive_c/Python312/python.exe /home/mt5/pars-connector/connector.json
+Restart=on-failure
+RestartSec=15
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

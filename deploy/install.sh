@@ -50,6 +50,7 @@ PY
 fi
 printf '\n[1/4] Preparing configuration; preserving existing secrets.\n'
 python3 deploy/configure.py "${config_args[@]}" --reuse
+configure_build_backend
 docker compose config --quiet
 printf '\n[2/4] Checking required HTTPS services.\n'
 python3 deploy/check-network.py --mode "$mode"

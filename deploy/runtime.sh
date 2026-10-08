@@ -1,5 +1,19 @@
 #!/usr/bin/env bash
 # Shared installer/update helpers. Never source .env as shell code.
+configure_build_backend() {
+  local compose_files
+  compose_files="$(python3 - <<'PY'
+from pathlib import Path
+settings = dict(line.split('=', 1) for line in Path('.env').read_text().splitlines() if '=' in line and not line.startswith('#'))
+print(settings.get('COMPOSE_FILE', ''))
+PY
+)" || return 1
+  # Compose's Bake backend requires a separate interactive host-network grant.
+  # Use Compose's direct BuildKit backend for the explicitly selected host build.
+  if [[ "$compose_files" == 'compose.yaml:deploy/compose.host-build.yaml' ]]; then
+    export COMPOSE_BAKE=false
+  fi
+}
 image_for_commit() {
   local revision="$1" origin repository
   [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || { printf 'Invalid source revision.\n' >&2; return 1; }

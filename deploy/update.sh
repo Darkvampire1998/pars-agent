@@ -3,6 +3,7 @@ set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 [[ -d .git && -f .env ]] || { printf 'Run this inside an installed Git checkout with .env.\n' >&2; exit 1; }
 source deploy/runtime.sh
+configure_build_backend
 [[ -z "$(git status --porcelain --untracked-files=no)" ]] || { printf 'Tracked files have local changes; update stopped.\n' >&2; exit 1; }
 branch="$(git symbolic-ref --quiet --short HEAD)" || { printf 'Detached checkout; review the intended release before updating.\n' >&2; exit 1; }
 [[ "$branch" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || { printf 'Invalid branch.\n' >&2; exit 1; }

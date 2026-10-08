@@ -27,7 +27,7 @@ jobs:
           python deploy/configure.py --ip 8.8.8.8 --port 8443 --host-build-network
           docker compose config --quiet
           docker compose run --rm --no-deps caddy caddy validate --config /etc/caddy/Caddyfile
-          docker compose build app
+          COMPOSE_BAKE=false docker compose build app
           python deploy/configure.py --domain trade.example.com --reconfigure
           docker compose config --quiet
           docker compose run --rm --no-deps caddy caddy validate --config /etc/caddy/Caddyfile
@@ -64,3 +64,16 @@ jobs:
             org.opencontainers.image.description=Pars Agent MT5 trading panel
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Verify published image starts without building
+        run: |
+          source deploy/runtime.sh
+          ready_image="$IMAGE:git-$GITHUB_SHA"
+          pull_image "$ready_image"
+          ready_digest="$(verify_image "$ready_image" "$GITHUB_SHA")"
+          python deploy/configure.py --ip 8.8.8.8 --image "$ready_digest"
+          docker compose config --quiet
+          docker compose up -d --no-build --pull never --wait --wait-timeout 120 app
+          docker compose exec -T app python -c 'import json,urllib.request; result=json.load(urllib.request.urlopen("http://127.0.0.1:8000/api/health", timeout=10)); assert result["status"] == "ok", result'
+      - name: Clean up smoke-test containers
+        if: always()
+        run: docker compose down

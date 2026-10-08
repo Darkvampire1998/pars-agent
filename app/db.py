@@ -15,6 +15,9 @@ CREATE TABLE IF NOT EXISTS telegram(user_id TEXT PRIMARY KEY,token TEXT,chat_id 
 CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY,user_id TEXT,message TEXT,status TEXT,attempts INTEGER NOT NULL DEFAULT 0,next_try REAL,last_error TEXT);
 CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,user_id TEXT,account_id TEXT,event TEXT,data TEXT,created REAL);
 CREATE TABLE IF NOT EXISTS rate_limits(key TEXT PRIMARY KEY,count INTEGER,reset REAL);
+CREATE TABLE IF NOT EXISTS connections(account_id TEXT PRIMARY KEY,password TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 1,status TEXT NOT NULL DEFAULT 'waiting',updated REAL,checked REAL);
+CREATE TABLE IF NOT EXISTS decisions(account_id TEXT PRIMARY KEY,data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS safety(account_id TEXT PRIMARY KEY,day TEXT,reason TEXT,updated REAL);
 CREATE INDEX IF NOT EXISTS idx_ideas ON ideas(account_id,created);
 CREATE INDEX IF NOT EXISTS idx_outbox ON outbox(status,next_try);
 """

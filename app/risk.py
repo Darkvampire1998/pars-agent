@@ -1,5 +1,23 @@
 """Fail-closed admission checks; MT5 repeats sizing with OrderCalcProfit."""
 import math
+import re
+
+def exposure(symbol, side):
+    match=re.match(r'^(AUD|CAD|CHF|EUR|GBP|JPY|NZD|USD|XAU|XAG|BTC|ETH)(AUD|CAD|CHF|EUR|GBP|JPY|NZD|USD)',symbol.upper())
+    if not match: return set()
+    sign=1 if side=='BUY' else -1
+    return {(match[1],sign),(match[2],-sign)}
+
+def position_gate(config, snapshot, side):
+    positions=snapshot.get('positions')
+    if snapshot['positions_count'] and positions is None and (config.get('one_position_per_symbol') or config.get('block_shared_currency')):
+        return 'برای کنترل نماد/ارز مشترک، کانکتور را به‌روز کنید'
+    for p in positions or []:
+        if config.get('one_position_per_symbol') and p['symbol']==snapshot['symbol']:
+            return 'پوزیشن این نماد از قبل باز است'
+        if config.get('block_shared_currency') and exposure(p['symbol'],p['side']) & exposure(snapshot['symbol'],side):
+            return 'جهت ریسک مشترک ارز/فلز با پوزیشن باز وجود دارد'
+    return None
 
 def gate(config, snapshot, baseline, daily_start, now):
     if not config["running"]:

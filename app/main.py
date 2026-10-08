@@ -5,6 +5,8 @@ import re
 import secrets
 import sqlite3
 import time
+import io
+import zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -14,13 +16,16 @@ from uuid import uuid4
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.exceptions import RequestValidationError
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .db import initialize, transaction
-from .risk import gate, market_levels
+from .risk import gate, market_levels, position_gate
 from .security import cipher, decrypt, digest, encrypt, hash_password, verify_password
-from .strategies import CATALOG, analyze
+from .strategies import CATALOG, analyze, indicators, select_candidate
+from .evaluation import evaluate
 
 ROOT = Path(__file__).parent
 def uid(): return uuid4().hex
@@ -38,7 +43,7 @@ class Credentials(Model):
 class Config(Model):
     running: bool = False
     mode: Literal["signals", "demo", "live"] = "signals"
-    strategies: list[Literal["ema_cross", "rsi_range", "donchian"]] = Field(default_factory=lambda: list(CATALOG), min_length=1, max_length=3)
+    strategies: list[Literal["ema_cross", "rsi_range", "donchian", "trend_pullback", "bollinger_reversion"]] = Field(default_factory=lambda: list(CATALOG), min_length=1, max_length=5)
     symbols: list[str] = Field(default_factory=lambda: ["EURUSD"], min_length=1, max_length=20)
     timeframe: Literal["M5", "M15", "H1"] = "M5"
     risk_pct: float = Field(default=0.5, ge=0.05, le=2)
@@ -50,6 +55,16 @@ class Config(Model):
     max_deviation_points: int = Field(default=10, ge=0, le=500)
     cost_buffer_pct: float = Field(default=20, ge=0, le=100)
     rr: float = Field(default=2, ge=1, le=5)
+    decision_policy: Literal['priority', 'adaptive', 'consensus'] = 'priority'
+    min_votes: int = Field(default=2, ge=1, le=5)
+    cooldown_seconds: int = Field(default=0, ge=0, le=86400)
+    max_daily_entries: int = Field(default=0, ge=0, le=100)
+    max_losing_exits: int = Field(default=0, ge=0, le=20)
+    max_spread_atr: float = Field(default=1, ge=.01, le=2)
+    volatility_filter: bool = False
+    risk_day_offset_minutes: int = Field(default=0, ge=-720, le=840)
+    one_position_per_symbol: bool = False
+    block_shared_currency: bool = False
     @model_validator(mode="after")
     def valid(self):
         if self.risk_pct * (1 + self.cost_buffer_pct / 100) > self.max_open_risk_pct:
@@ -58,13 +73,27 @@ class Config(Model):
             raise ValueError("حد ضرر روزانه باید کمتر از حد ضرر کل باشد")
         if len(set(self.symbols)) != len(self.symbols) or any(not re.fullmatch(r"[A-Za-z0-9_.#-]{1,32}", s) for s in self.symbols):
             raise ValueError("نام نماد نامعتبر یا تکراری است")
+        if len(set(self.strategies)) != len(self.strategies):
+            raise ValueError('راهبرد تکراری است')
         return self
+
+PROFILES = {
+    'conservative': {'risk_pct': .25, 'max_open_risk_pct': 1, 'daily_loss_pct': 3, 'total_loss_pct': 6, 'max_positions': 2, 'timeframe': 'M15', 'decision_policy': 'adaptive', 'cooldown_seconds': 300, 'max_daily_entries': 6, 'max_losing_exits': 3, 'max_spread_atr': .15, 'volatility_filter': True},
+    'balanced': {'risk_pct': .5, 'max_open_risk_pct': 1.5, 'daily_loss_pct': 4, 'total_loss_pct': 8, 'max_positions': 3, 'timeframe': 'M15', 'decision_policy': 'adaptive', 'cooldown_seconds': 180, 'max_daily_entries': 10, 'max_losing_exits': 3, 'max_spread_atr': .2, 'volatility_filter': True},
+}
+for profile in PROFILES.values():
+    profile.update({'one_position_per_symbol': True, 'block_shared_currency': True})
+
+def account_config(raw):
+    # Old accounts retain their choices and legacy policy; new fields gain defaults.
+    return Config(**json.loads(raw)).model_dump()
 
 class NewAccount(Model):
     name: str = Field(min_length=1, max_length=80)
     login: str = Field(pattern=r"^[0-9]{1,20}$")
     server: str = Field(min_length=1, max_length=100)
     initial_equity: float = Field(gt=0, le=1e12)
+    password: str = Field(default='', max_length=128, repr=False)
 
 class Bar(Model):
     time: int = Field(gt=0)
@@ -114,11 +143,20 @@ class Snapshot(Model):
     pending_orders: int = Field(ge=0)
     bars: list[Bar] = Field(min_length=60, max_length=250)
     deals: list[Deal] = Field(default_factory=list, max_length=200)
+    positions: list['Position'] | None = Field(default=None, max_length=100)
     @model_validator(mode="after")
     def valid(self):
         if self.ask < self.bid or any(a.time >= b.time for a, b in zip(self.bars, self.bars[1:])):
             raise ValueError("Invalid quote or candle ordering")
+        if self.positions is not None and len(self.positions)!=self.positions_count:
+            raise ValueError('Position count mismatch')
         return self
+
+class Position(Model):
+    symbol: str = Field(pattern=r'^[A-Za-z0-9_.#-]{1,32}$')
+    side: Literal['BUY','SELL']
+
+Snapshot.model_rebuild()
 
 class Result(Model):
     id: str = Field(pattern=r"^[a-f0-9]{32}$")
@@ -132,6 +170,32 @@ class TelegramConfig(Model):
     token: str = Field(default="", max_length=150)
     chat_id: str = Field(pattern=r"^-?[0-9]{1,20}$")
     enabled: bool = True
+
+class ConnectionCredentials(Model):
+    password: str = Field(min_length=1, max_length=128, repr=False)
+
+class BridgeInstance(Model):
+    instance_id: str = Field(min_length=8, max_length=60, pattern=r'^[A-Za-z0-9_-]+$')
+
+class BridgeStatus(BridgeInstance):
+    status: Literal['connecting', 'connected', 'login_failed', 'disconnected', 'permissions_blocked', 'data_unavailable']
+
+class EvaluationRequest(Model):
+    bars: list[Bar] = Field(min_length=300, max_length=3000)
+    strategies: list[Literal['ema_cross','rsi_range','donchian','trend_pullback','bollinger_reversion']] = Field(min_length=1, max_length=5)
+    policy: Literal['priority','adaptive','consensus'] = 'adaptive'
+    min_votes: int = Field(default=2, ge=1, le=5)
+    rr: float = Field(default=2, ge=1, le=5)
+    point: float = Field(gt=0, le=1e6)
+    spread: float = Field(ge=0, le=10000)
+    slippage: float = Field(ge=0, le=10000)
+    commission_bps: float = Field(default=0, ge=0, le=100)
+    risk_pct: float = Field(default=.25, ge=.05, le=2)
+    @model_validator(mode='after')
+    def chronological(self):
+        if any(a.time >= b.time for a,b in zip(self.bars,self.bars[1:])):
+            raise ValueError('کندل‌ها باید به ترتیب زمان و بدون تکرار باشند')
+        return self
 
 def audit(db, user, account, event, data):
     db.execute("INSERT INTO audit(user_id,account_id,event,data,created) VALUES(?,?,?,?,?)", (user, account, event, js(data), now()))
@@ -190,7 +254,7 @@ def public_account(a):
     a = dict(a)
     a.pop("key_hash", None)
     a.pop("user_id", None)
-    a["config"] = json.loads(a["config"])
+    a["config"] = account_config(a["config"])
     a["snapshot"] = json.loads(a["snapshot"]) if a["snapshot"] else None
     a["connected"] = bool(a["last_seen"] and now() - a["last_seen"] < 20)
     return a
@@ -254,11 +318,17 @@ async def lifespan(app):
     except asyncio.CancelledError:
         pass
 
-app = FastAPI(title="Pars Agent", version="0.1.0", lifespan=lifespan, docs_url=None, redoc_url=None)
+app = FastAPI(title="Pars Agent", version="0.3.0", lifespan=lifespan, docs_url=None, redoc_url=None)
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(request, error):
+    # Never echo passwords, bridge keys or complete request bodies in 422 responses.
+    return JSONResponse(status_code=422, content={'detail': [{'loc': list(e['loc']), 'msg': e['msg'], 'type': e['type']} for e in error.errors()]})
 
 @app.middleware("http")
 async def headers(request, call_next):
-    if request.headers.get("content-length", "").isdigit() and int(request.headers["content-length"]) > 400_000:
+    body_limit = 1_048_576 if re.fullmatch(r'/api/accounts/[^/]+/evaluate', request.url.path) else 400_000
+    if request.headers.get("content-length", "").isdigit() and int(request.headers["content-length"]) > body_limit:
         return PlainTextResponse("Payload too large", status_code=413)
     response = await call_next(request)
     response.headers["Cache-Control"] = "no-store"
@@ -275,7 +345,7 @@ app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 def health():
     with transaction() as db:
         db.execute("SELECT 1")
-    return {"status": "ok", "version": "0.1.0"}
+    return {"status": "ok", "version": "0.3.0"}
 
 def session_response(db, user_id, response):
     raw, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(24)
@@ -314,7 +384,7 @@ def login(c: Credentials, request: Request, response: Response):
 def me(u=Depends(user)):
     with transaction() as db:
         tg = db.execute("SELECT chat_id,enabled FROM telegram WHERE user_id=?", (u["user_id"],)).fetchone()
-    return {"email": u["email"], "csrf": u["csrf"], "live_allowed": live_allowed(), "telegram": dict(tg) if tg else None, "strategies": CATALOG}
+    return {"email": u["email"], "csrf": u["csrf"], "live_allowed": live_allowed(), "telegram": dict(tg) if tg else None, "strategies": CATALOG, 'profiles': PROFILES, 'version': '0.3.0'}
 
 @app.post("/api/logout")
 def logout(response: Response, u=Depends(user)):
@@ -334,10 +404,13 @@ def add_account(data: NewAccount, u=Depends(user)):
         if db.execute("SELECT COUNT(*) FROM accounts WHERE user_id=?", (u["user_id"],)).fetchone()[0] >= 10:
             raise HTTPException(400, "سقف ۱۰ حساب برای هر کاربر")
         try:
-            db.execute("INSERT INTO accounts(id,user_id,name,login,server,key_hash,config,baseline) VALUES(?,?,?,?,?,?,?,?)", (aid, u["user_id"], data.name, data.login, data.server, digest(raw), js(Config().model_dump()), data.initial_equity))
+            config = Config(**PROFILES['conservative']).model_dump()
+            db.execute("INSERT INTO accounts(id,user_id,name,login,server,key_hash,config,baseline) VALUES(?,?,?,?,?,?,?,?)", (aid, u["user_id"], data.name, data.login, data.server, digest(raw), js(config), data.initial_equity))
         except sqlite3.IntegrityError:
             raise HTTPException(409, "این حساب قبلاً متصل شده است")
         audit(db, u["user_id"], aid, "account.created", {})
+        if data.password:
+            db.execute('INSERT INTO connections(account_id,password,updated) VALUES(?,?,?)', (aid, encrypt(data.password), now()))
     return {"id": aid, "bridge_key": raw}
 
 @app.put("/api/accounts/{aid}/config")
@@ -347,6 +420,12 @@ def configure(aid: str, config: Config, u=Depends(user)):
     with transaction() as db:
         a = owned(db, aid, u["user_id"])
         snapshot = json.loads(a["snapshot"]) if a["snapshot"] else None
+        old_config=account_config(a['config'])
+        halted = safety_reason(db, aid, old_config)
+        if config.risk_day_offset_minutes!=old_config['risk_day_offset_minutes'] and (old_config['running'] or halted or (snapshot and snapshot['positions_count'])):
+            raise HTTPException(409,'تغییر شروع روز فقط با ایجنت متوقف و بدون پوزیشن/توقف حفاظتی مجاز است')
+        if config.running and halted:
+            raise HTTPException(409, halted)
         if config.running and config.mode != "signals" and (not snapshot or now() - a["last_seen"] > 20):
             raise HTTPException(409, "ابتدا ترمینال متاتریدر را متصل کنید")
         db.execute("UPDATE accounts SET config=? WHERE id=?", (js(config.model_dump()), aid))
@@ -381,10 +460,100 @@ def rotate(aid: str, u=Depends(user)):
 def dashboard(aid: str, u=Depends(user)):
     with transaction() as db:
         a = owned(db, aid, u["user_id"])
-        return {"account": public_account(a), "markets": [json.loads(r[0]) for r in db.execute("SELECT data FROM markets WHERE account_id=?", (aid,)).fetchall()],
+        decision = db.execute('SELECT data FROM decisions WHERE account_id=?', (aid,)).fetchone()
+        return {"account": public_account(a), 'connection': connection_info(db, aid), 'safety_halt': safety_reason(db, aid, account_config(a['config'])), 'decision': json.loads(decision[0]) if decision else None, "markets": [json.loads(r[0]) for r in db.execute("SELECT data FROM markets WHERE account_id=?", (aid,)).fetchall()],
                 "ideas": [json.loads(r[0]) for r in db.execute("SELECT data FROM ideas WHERE account_id=? ORDER BY created DESC LIMIT 30", (aid,)).fetchall()],
                 "orders": [dict(r) | {"data": json.loads(r["data"]), "result": json.loads(r["result"]) if r["result"] else None} for r in db.execute("SELECT * FROM orders WHERE account_id=? ORDER BY created DESC LIMIT 50", (aid,)).fetchall()],
                 "audit": [dict(r) for r in db.execute("SELECT event,created FROM audit WHERE account_id=? ORDER BY id DESC LIMIT 30", (aid,)).fetchall()]}
+
+def connection_info(db, aid):
+    row = db.execute('SELECT revision,status,checked,updated FROM connections WHERE account_id=?', (aid,)).fetchone()
+    if not row: return {'configured': False, 'status': 'mql5', 'note': 'اتصال با اکسپرت؛ رمز در ترمینال نگهداری می‌شود'}
+    state = dict(row)
+    if state['checked'] and now()-state['checked'] > 30: state['status'] = 'disconnected'
+    return state | {'configured': True, 'note': 'ورود با رمز توسط کانکتور متاتریدر انجام می‌شود'}
+
+@app.put('/api/accounts/{aid}/connection')
+def save_connection(aid: str, credentials: ConnectionCredentials, u=Depends(user)):
+    raw = secrets.token_urlsafe(36)
+    with transaction() as db:
+        a = owned(db, aid, u['user_id'])
+        if account_config(a['config'])['running']:
+            raise HTTPException(409, 'ابتدا ایجنت را متوقف کنید')
+        if db.execute("SELECT 1 FROM orders WHERE account_id=? AND status IN ('claimed','unknown')", (aid,)).fetchone():
+            raise HTTPException(409, 'ابتدا سفارش نامشخص را تطبیق دهید')
+        old = db.execute('SELECT revision FROM connections WHERE account_id=?', (aid,)).fetchone()
+        revision = old[0]+1 if old else 1
+        db.execute("INSERT OR REPLACE INTO connections(account_id,password,revision,status,updated) VALUES(?,?,?,'waiting',?)", (aid, encrypt(credentials.password), revision, now()))
+        db.execute('UPDATE accounts SET key_hash=?,instance_id=NULL,last_seen=NULL,snapshot=NULL WHERE id=?', (digest(raw),aid))
+        db.execute("UPDATE orders SET status='cancelled',updated=? WHERE account_id=? AND status='prepared'", (now(),aid))
+        audit(db,u['user_id'],aid,'connection.credentials_updated',{'revision':revision})
+    return {'bridge_key': raw, 'note': 'رمز رمزگذاری شد؛ کلید قبلی باطل شد. کلید جدید را به کانکتور بدهید.'}
+
+@app.post('/api/bridge/connection')
+def worker_connection(instance: BridgeInstance, response: Response, aid=Depends(bridge)):
+    with transaction() as db:
+        a = db.execute('SELECT * FROM accounts WHERE id=?',(aid,)).fetchone()
+        row = db.execute('SELECT * FROM connections WHERE account_id=?',(aid,)).fetchone()
+        if not row: raise HTTPException(409,'ابتدا رمز اتصال را در پنل ذخیره کنید')
+        if a['instance_id'] and a['instance_id'] != instance.instance_id:
+            raise HTTPException(409,'این حساب به کانکتور دیگری متصل است')
+        db.execute('UPDATE accounts SET instance_id=? WHERE id=?',(instance.instance_id,aid))
+        response.headers['Cache-Control']='no-store'
+        return {'login':a['login'],'server':a['server'],'password':decrypt(row['password']),'revision':row['revision'],'config':account_config(a['config'])}
+
+@app.post('/api/bridge/status')
+def worker_status(state: BridgeStatus, aid=Depends(bridge)):
+    with transaction() as db:
+        a = db.execute('SELECT * FROM accounts WHERE id=?',(aid,)).fetchone()
+        if a['instance_id'] != state.instance_id: raise HTTPException(409,'کانکتور متفاوت است')
+        db.execute('UPDATE connections SET status=?,checked=? WHERE account_id=?',(state.status,now(),aid))
+    return {'ok':True}
+
+@app.get('/api/connector/download')
+def connector_download(u=Depends(user)):
+    output = io.BytesIO()
+    with zipfile.ZipFile(output,'w',zipfile.ZIP_DEFLATED) as bundle:
+        for name in ('connector.py','requirements.txt','setup.ps1','README.md'):
+            path=ROOT.parent/'mt5'/name
+            if not path.is_file(): raise HTTPException(503,'بسته کانکتور آماده نیست')
+            bundle.write(path,name)
+        for path in sorted((ROOT.parent/'connector-wheels').glob('*.whl')):
+            bundle.write(path,'wheels/'+path.name)
+    output.seek(0)
+    return StreamingResponse(output,media_type='application/zip',headers={'Content-Disposition':'attachment; filename="pars-mt5-connector.zip"','Cache-Control':'no-store'})
+
+@app.post('/api/accounts/{aid}/evaluate')
+def strategy_evaluation(aid: str, request: Request, data: EvaluationRequest, u=Depends(user)):
+    with transaction() as db:
+        owned(db,aid,u['user_id'])
+        throttle(db,request,'evaluation:'+u['user_id'],3)
+    settings=data.model_dump(); bars=settings.pop('bars')
+    return evaluate(bars,**settings)
+
+def risk_day(config):
+    return datetime.fromtimestamp(now(),timezone(timedelta(minutes=config['risk_day_offset_minutes']))).date().isoformat()
+
+def safety_reason(db, aid, config):
+    row=db.execute('SELECT * FROM safety WHERE account_id=?',(aid,)).fetchone()
+    if row and (row['reason']=='total' or row['day']==risk_day(config)):
+        return 'توقف حفاظتی فعال است: حد ضرر کل' if row['reason']=='total' else 'توقف حفاظتی تا شروع روز بعد فعال است'
+    return None
+
+@app.post('/api/accounts/{aid}/reset-safety')
+def reset_safety(aid: str,u=Depends(user)):
+    with transaction() as db:
+        a=owned(db,aid,u['user_id']); c=account_config(a['config'])
+        s=json.loads(a['snapshot']) if a['snapshot'] else None
+        if c['running'] or not s or now()-(a['last_seen'] or 0)>20 or s['positions_count'] or s['pending_orders']:
+            raise HTTPException(409,'ایجنت باید متوقف، ترمینال متصل و حساب بدون پوزیشن/سفارش باشد')
+        if s['equity']<=a['baseline']*(1-c['total_loss_pct']/100): raise HTTPException(409,'سرمایه هنوز پایین‌تر از حد ضرر کل است')
+        row=db.execute('SELECT * FROM safety WHERE account_id=?',(aid,)).fetchone()
+        if row and row['reason']=='daily' and row['day']==risk_day(c): raise HTTPException(409,'توقف روزانه تا روز بعد باقی می‌ماند')
+        if db.execute("SELECT 1 FROM orders WHERE account_id=? AND status IN ('claimed','unknown')",(aid,)).fetchone(): raise HTTPException(409,'ابتدا سفارش نامشخص را تطبیق دهید')
+        db.execute('DELETE FROM safety WHERE account_id=?',(aid,))
+        audit(db,u['user_id'],aid,'safety.reset',{})
+    return {'ok':True}
 
 @app.get("/api/accounts/{aid}/report")
 def account_report(aid: str, u=Depends(user)):
@@ -433,11 +602,11 @@ def telegram_report(aid: str, u=Depends(user)):
 def bridge_config(aid=Depends(bridge)):
     with transaction() as db:
         a = db.execute("SELECT * FROM accounts WHERE id=?", (aid,)).fetchone()
-        return json.loads(a["config"])
+        return account_config(a["config"])
 
 def accept_snapshot(db, aid, s):
     a = dict(db.execute("SELECT * FROM accounts WHERE id=?", (aid,)).fetchone())
-    c = json.loads(a["config"])
+    c = account_config(a["config"])
     if s.login != a["login"] or s.server != a["server"]:
         raise HTTPException(403, "حساب ترمینال با حساب ثبت‌شده تطابق ندارد")
     if a["instance_id"] and a["instance_id"] != s.instance_id:
@@ -448,7 +617,7 @@ def accept_snapshot(db, aid, s):
         raise HTTPException(409, "ساعت ترمینال یا قیمت قدیمی است")
     data = s.model_dump()
     data["received_at"] = now()
-    day = datetime.now(timezone.utc).date().isoformat()
+    day = risk_day(c)
     if a["day"] != day:
         previous = json.loads(a["snapshot"]) if a["snapshot"] else {}
         a["day_start"] = max(s.balance, s.equity, previous.get("equity", 0))
@@ -462,10 +631,32 @@ def accept_snapshot(db, aid, s):
         if inserted and now() - d["time"] < 120:
             net = d["profit"] + d["commission"] + d["swap"]
             enqueue(db, a["user_id"], f"دیل متاتریدر | {a['name']}\n{d['symbol']} {d['side']} · {d['entry']}\nحجم: {d['volume']} · قیمت: {d['price']}\nخالص: {net:.2f} {s.currency}", "deal:" + aid + ":" + d["ticket"])
+    if c['running'] and c['mode'] != 'signals':
+        reason = 'total' if s.equity <= a['baseline']*(1-c['total_loss_pct']/100) else ('daily' if s.equity <= a['day_start']*(1-c['daily_loss_pct']/100) else None)
+        if reason:
+            c['running']=False
+            db.execute('UPDATE accounts SET config=? WHERE id=?',(js(c),aid))
+            db.execute('INSERT OR REPLACE INTO safety VALUES(?,?,?,?)',(aid,day,reason,now()))
+            db.execute("UPDATE orders SET status='cancelled',updated=? WHERE account_id=? AND status='prepared'",(now(),aid))
+            audit(db,a['user_id'],aid,'safety.halted',{'reason':reason})
+            enqueue(db,a['user_id'],f"توقف حفاظتی {a['name']}: حد ضرر {reason}. ورود جدید متوقف شد.")
     return a, c, data
 
 def admission(db, a, c, data, exclude=None):
     if c["mode"] == "live" and not live_allowed(): return "معامله واقعی در سرور بسته است"
+    halted=safety_reason(db,a['id'],c)
+    if halted: return halted
+    start=datetime.combine(datetime.fromtimestamp(now(),timezone(timedelta(minutes=c['risk_day_offset_minutes']))).date(),datetime.min.time(),tzinfo=timezone(timedelta(minutes=c['risk_day_offset_minutes']))).timestamp()
+    count,last=db.execute("SELECT count(*),max(updated) FROM orders WHERE account_id=? AND status='executed' AND updated>=?",(a['id'],start)).fetchone()
+    if c['max_daily_entries'] and count>=c['max_daily_entries']: return 'سقف ورود روزانه رسیده است'
+    if last and now()-last<c['cooldown_seconds']: return 'وقفه بین ورودها فعال است'
+    if c['max_losing_exits']:
+        exits=[json.loads(r[0]) for r in db.execute('SELECT data FROM deals WHERE account_id=? AND time>=? ORDER BY time DESC,ticket DESC LIMIT 100',(a['id'],start))]
+        exits=[d for d in exits if d['entry'] in ('out','out_by','inout')][:c['max_losing_exits']]
+        if len(exits)==c['max_losing_exits'] and all(d['profit']+d['commission']+d['swap']<0 for d in exits): return 'وقفه پس از خروج‌های زیانده متوالی؛ تا روز بعد'
+    context=indicators(data['bars'])
+    if context['atr'] and (data['ask']-data['bid'])/context['atr']>c['max_spread_atr']: return 'هزینه اسپرد نسبت به نوسان زیاد است'
+    if c['volatility_filter'] and context['volatility_shock']: return 'نوسان غیرعادی؛ ورود جدید مسدود است'
     if db.execute("SELECT 1 FROM orders WHERE account_id=? AND status IN ('claimed','unknown','prepared') AND id!=?", (a["id"], exclude or "")).fetchone():
         return "سفارش در انتظار اجرا یا تطبیق با بروکر است"
     return gate(c, data, a["baseline"], a["day_start"], now())
@@ -474,22 +665,24 @@ def admission(db, a, c, data, exclude=None):
 def poll(s: Snapshot, aid=Depends(bridge)):
     with transaction() as db:
         a, c, data = accept_snapshot(db, aid, s)
+        context=indicators(data['bars'])
         ideas = []
         for strategy in c["strategies"]:
             idea = analyze(data["bars"], strategy, c["rr"])
+            idea.update(context)
             idea.update({"id": uid(), "symbol": s.symbol, "timeframe": s.timeframe, "strategy": strategy, "candle": s.bars[-1].time, "created": now()})
             if idea["side"] != "WAIT":
                 idea["entry"], idea["sl"], idea["tp"] = market_levels(idea, data, c["rr"])
             inserted = db.execute("INSERT OR IGNORE INTO ideas VALUES(?,?,?,?,?,?,?,?)", (idea["id"], aid, s.symbol, s.timeframe, s.bars[-1].time, strategy, js(idea), now())).rowcount
             if inserted: ideas.append(idea)
         error = admission(db, a, c, data)
-        candidates = [x for x in ideas if x["side"] != "WAIT"]
-        if len({x["side"] for x in candidates}) > 1:
-            error = "استراتژی‌ها جهت‌های متضاد دارند"
-        if candidates and not error:
-            idea = candidates[0]
+        idea, selection_error=select_candidate(ideas,c['decision_policy'],c['min_votes'])
+        error=error or selection_error
+        if idea and not error: error=position_gate(c,data,idea['side'])
+        db.execute('INSERT OR REPLACE INTO decisions VALUES(?,?)',(aid,js({'reason':error or 'سفارش آماده است','regime':context['regime'],'adx':context['adx'],'atr':context['atr'],'policy':c['decision_policy'],'updated':now()})))
+        if idea and not error:
             order = {"id": uid(), "symbol": s.symbol, "side": idea["side"], "entry": idea["entry"], "sl": idea["sl"], "tp": idea["tp"], "risk_money": s.equity * c["risk_pct"] / 100, "risk_pct": c["risk_pct"], "max_spread_points": c["max_spread_points"], "max_deviation_points": c["max_deviation_points"], "expires_at": now() + 12,
-                     "max_open_risk_pct": c["max_open_risk_pct"], "max_positions": c["max_positions"], "cost_buffer_pct": c["cost_buffer_pct"], "daily_floor": a["day_start"] * (1 - c["daily_loss_pct"] / 100), "total_floor": a["baseline"] * (1 - c["total_loss_pct"] / 100), "mode": c["mode"]}
+                     "max_open_risk_pct": c["max_open_risk_pct"], "max_positions": c["max_positions"], "cost_buffer_pct": c["cost_buffer_pct"], "daily_floor": a["day_start"] * (1 - c["daily_loss_pct"] / 100), "total_floor": a["baseline"] * (1 - c["total_loss_pct"] / 100), "mode": c["mode"], "one_position_per_symbol": int(c["one_position_per_symbol"]), "block_shared_currency": int(c["block_shared_currency"])}
             db.execute("INSERT INTO orders VALUES(?,?,?,'prepared',?,?,?,NULL)", (order["id"], aid, idea["id"], js(order), now(), now()))
         # Return an existing unclaimed order only on its originating symbol; never resend claimed.
         row = db.execute("SELECT data FROM orders WHERE account_id=? AND status='prepared'", (aid,)).fetchone()
@@ -508,6 +701,7 @@ def claim(oid: str, s: Snapshot, aid=Depends(bridge)):
         order = json.loads(row["data"])
         if order["symbol"] != s.symbol or order["expires_at"] < now(): raise HTTPException(409, "سفارش منقضی یا نماد متفاوت است")
         error = admission(db, a, c, data, oid)
+        error=error or position_gate(c,data,order['side'])
         if error: raise HTTPException(409, error)
         # Config changes cancel prepared orders. Verify drift before handing off.
         entry = s.ask if order["side"] == "BUY" else s.bid

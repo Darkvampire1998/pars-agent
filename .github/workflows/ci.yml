@@ -21,6 +21,7 @@ jobs:
       - run: npm install --no-save --package-lock=false jsdom
       - run: node tests/frontend.cjs
       - run: bash -n deploy/bootstrap.sh deploy/install.sh deploy/update.sh deploy/backup.sh deploy/manage.sh deploy/runtime.sh
+      - run: bash -n mt5/run-wine.sh
       - run: docker build -t pars-agent:ci .
       - name: Validate domain and IP deployment configurations
         run: |
@@ -33,8 +34,20 @@ jobs:
           docker compose run --rm --no-deps caddy caddy validate --config /etc/caddy/Caddyfile
           python deploy/configure.py --domain trade.example.com --image ghcr.io/test/pars-agent:git-0000000000000000000000000000000000000000 --reuse
           docker compose config --format json | python -c 'import json,sys; app=json.load(sys.stdin)["services"]["app"]; assert "build" not in app; assert app["image"].startswith("ghcr.io/")'
+  connector-sdk:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - run: python -m pip install -r mt5/requirements.txt
+      - run: python -c "import MetaTrader5 as mt5, numpy; assert mt5.__version__ == '5.0.6231'; print('Official Windows SDK imports successfully')"
+      - run: python -c "import ast, pathlib; ast.parse(pathlib.Path('mt5/connector.py').read_text()); print('Connector syntax validated')"
+      - run: '$null = [scriptblock]::Create((Get-Content mt5/setup.ps1 -Raw)); Write-Host "PowerShell setup syntax validated"'
   publish:
-    needs: tests
+    needs: [tests, connector-sdk]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
@@ -74,6 +87,7 @@ jobs:
           docker compose config --quiet
           docker compose up -d --no-build --pull never --wait --wait-timeout 120 app
           docker compose exec -T app python -c 'import json,urllib.request; result=json.load(urllib.request.urlopen("http://127.0.0.1:8000/api/health", timeout=10)); assert result["status"] == "ok", result'
+          docker compose exec -T app python -c 'from pathlib import Path; wheels=list(Path("/app/connector-wheels").glob("*.whl")); assert len(wheels)>=2; assert Path("/app/mt5/connector.py").is_file(); print("Offline connector wheels bundled")'
       - name: Clean up smoke-test containers
         if: always()
         run: docker compose down

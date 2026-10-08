@@ -139,7 +139,7 @@ def test_reconfigure_needs_explicit_address_change_and_valid_key(tmp_path):
     (0, 1, 'HTTPS is not verified yet'), (0, 0, 'Panel is responding over verified HTTPS')])
 def test_install_reports_success_only_after_verified_endpoint(tmp_path, build_result, tls_result, expected):
     deploy = tmp_path / 'deploy'; deploy.mkdir()
-    for name in ('configure.py', 'install.sh'):
+    for name in ('configure.py', 'install.sh', 'runtime.sh'):
         (deploy / name).write_bytes((ROOT / 'deploy' / name).read_bytes())
     (deploy / 'check-network.py').write_text('print("DNS/TLS preflight passed")\n')
     tools_dir = tmp_path / 'tools'; tools_dir.mkdir()
@@ -147,7 +147,7 @@ def test_install_reports_success_only_after_verified_endpoint(tmp_path, build_re
     (tools_dir / 'curl').write_text(f'#!/bin/sh\nexit {tls_result}\n')
     for file in tools_dir.iterdir():
         file.chmod(0o755)
-    r = subprocess.run(['bash', str(deploy / 'install.sh'), '--ip', '8.8.8.8', '--port', '8443'],
+    r = subprocess.run(['bash', str(deploy / 'install.sh'), '--ip', '8.8.8.8', '--port', '8443', '--source-build'],
                        text=True, capture_output=True, env={**os.environ, 'PATH': str(tools_dir) + ':' + os.environ['PATH']})
     assert expected in r.stdout + r.stderr
     assert (r.returncode == 0) == (build_result == tls_result == 0)
@@ -163,8 +163,143 @@ def test_network_preflight_distinguishes_dns_failure_from_http_error(monkeypatch
     def http_error(*a, **kw):
         raise network.urllib.error.HTTPError('https://files.pythonhosted.org/', 404, 'missing', {}, None)
     monkeypatch.setattr(network.urllib.request, 'urlopen', http_error)
-    assert network.main() == 0
+    assert network.probe(network.PYPI[1]) == 0
     def dns_error(*a, **kw):
         raise OSError('Temporary failure in name resolution')
     monkeypatch.setattr(network.socket, 'getaddrinfo', dns_error)
-    assert network.main() == 1
+    monkeypatch.setattr(network.urllib.request, 'urlopen', dns_error)
+    assert network.probe(network.PYPI[1]) == 1
+
+
+def test_image_preflight_ignores_pypi_and_optional_telegram(monkeypatch, capsys):
+    network = module('check-network')
+    visited = []
+    def check(url):
+        visited.append(url)
+        return url == network.ACME, 'network unavailable'
+    monkeypatch.setattr(network, 'check', check)
+    assert network.main(['--mode', 'image']) == 0
+    assert visited == [network.ACME, network.TELEGRAM]
+    assert 'Panel installation can continue' in capsys.readouterr().err
+    assert network.main(['--mode', 'source']) == 1
+
+
+def test_image_preflight_still_requires_certificate_service(monkeypatch):
+    network = module('check-network')
+    monkeypatch.setattr(network, 'check', lambda url: (False, 'unreachable'))
+    assert network.main(['--mode', 'image']) == 1
+
+
+def test_dns_probe_has_a_process_deadline(monkeypatch):
+    network = module('check-network')
+    def stalled(*args, **kwargs):
+        assert kwargs['timeout'] == 10
+        raise subprocess.TimeoutExpired(args[0], 10)
+    monkeypatch.setattr(network.subprocess, 'run', stalled)
+    ok, reason = network.check(network.PYPI[1])
+    assert not ok and 'timed out' in reason
+
+
+def test_switching_image_source_modes_preserves_key_and_secrets(tmp_path):
+    configure = module('configure')
+    path = tmp_path / '.env'
+    values = configure.endpoint(ip='8.8.8.8')
+    configure.write_config(path, values, host_build=True)
+    original_key = path.read_text().split('ENCRYPTION_KEY=', 1)[1].splitlines()[0]
+    image = 'ghcr.io/test/pars-agent:git-' + 'a' * 40
+    configure.write_config(path, values, reuse=True, image=image)
+    assert 'COMPOSE_FILE=compose.yaml:deploy/compose.image.yaml' in path.read_text()
+    assert 'PARS_AGENT_IMAGE=' + image in path.read_text()
+    configure.write_config(path, {}, reconfigure=True, image='ghcr.io/test/pars-agent@sha256:' + 'b' * 64)
+    assert 'PARS_AGENT_IMAGE=ghcr.io/test/pars-agent@sha256:' in path.read_text()
+    configure.write_config(path, values, reuse=True, source_build=True)
+    assert 'COMPOSE_FILE=compose.yaml\n' in path.read_text()
+    assert 'PARS_AGENT_IMAGE=\n' in path.read_text()
+    assert 'ENCRYPTION_KEY=' + original_key in path.read_text()
+
+
+@pytest.mark.parametrize('image', ['ghcr.io/test/app:latest', 'http://bad/app:tag',
+    'ghcr.io/test/app@sha256:bad', '$(touch /tmp/bad)'])
+def test_bad_image_is_rejected_before_config_mutation(tmp_path, image):
+    configure = module('configure')
+    path = tmp_path / '.env'
+    with pytest.raises(ValueError, match='Image must'):
+        configure.write_config(path, configure.endpoint(ip='8.8.8.8'), image=image)
+    assert not path.exists()
+
+
+@pytest.mark.parametrize('scenario', ['success', 'pull-fails', 'wrong-revision', 'tls-fails'])
+def test_ready_install_never_builds_and_pins_verified_digest(tmp_path, scenario):
+    deploy = tmp_path / 'deploy'; deploy.mkdir()
+    for name in ('configure.py', 'install.sh', 'runtime.sh'):
+        (deploy / name).write_bytes((ROOT / 'deploy' / name).read_bytes())
+    (deploy / 'check-network.py').write_text('print("preflight passed")\n')
+    subprocess.run(['git', 'init', '-q', '-b', 'main', str(tmp_path)], check=True)
+    subprocess.run(['git', '-C', str(tmp_path), 'remote', 'add', 'origin', 'https://github.com/test/pars-agent.git'], check=True)
+    subprocess.run(['git', '-C', str(tmp_path), 'add', 'deploy'], check=True)
+    subprocess.run(['git', '-C', str(tmp_path), '-c', 'user.name=Tester', '-c', 'user.email=test@example.com',
+                    'commit', '-qm', 'fixture'], check=True)
+    revision = subprocess.check_output(['git', '-C', str(tmp_path), 'rev-parse', 'HEAD'], text=True).strip()
+    tools_dir = tmp_path / 'tools'; tools_dir.mkdir()
+    log = tmp_path / 'docker.log'
+    digest = 'ghcr.io/test/pars-agent@sha256:' + 'b' * 64
+    (tools_dir / 'docker').write_text(f'''#!/bin/sh
+printf '%s\\n' "$*" >> '{log}'
+case "$1 $2" in
+  'compose version') if [ "$3" = --short ]; then echo 2.30.0; fi;;
+  'pull '*) exit {1 if scenario == 'pull-fails' else 0};;
+  'image inspect')
+    case "$4" in
+      *RepoDigests*) echo '["{digest}"]';;
+      *) echo '{'bad' if scenario == 'wrong-revision' else revision}';;
+    esac;;
+esac
+exit 0
+''')
+    (tools_dir / 'curl').write_text(f'#!/bin/sh\nexit {1 if scenario == "tls-fails" else 0}\n')
+    for item in tools_dir.iterdir(): item.chmod(0o755)
+    r = subprocess.run(['bash', str(deploy / 'install.sh'), '--ip', '8.8.8.8'], text=True,
+                       capture_output=True, env={**os.environ, 'PATH': str(tools_dir) + ':' + os.environ['PATH']})
+    calls = log.read_text()
+    assert 'compose build' not in calls and '--build' not in calls
+    assert 'pull ghcr.io/test/pars-agent:git-' + revision in calls
+    assert (r.returncode == 0) == (scenario == 'success'), r.stdout + r.stderr
+    if scenario in ('success', 'tls-fails'):
+        assert 'PARS_AGENT_IMAGE=' + digest in (tmp_path / '.env').read_text()
+        assert 'compose up -d --no-build --pull never' in calls
+    else:
+        assert 'compose up' not in calls
+        assert 'Panel is responding' not in r.stdout
+
+
+def test_failed_checkout_autoresume_still_rejects_wrong_origin(tmp_path):
+    subprocess.run(['git', 'init', '-q', '-b', 'main', str(tmp_path)], check=True)
+    subprocess.run(['git', '-C', str(tmp_path), 'remote', 'add', 'origin', 'https://github.com/other/project.git'], check=True)
+    r = run('--ip', '8.8.8.8', '--dir', str(tmp_path))
+    assert 'different origin' in r.stderr
+    assert 'Installing panel' not in r.stdout
+
+
+def test_clean_failed_install_resumes_without_apt_or_explicit_flag(tmp_path):
+    if os.geteuid() != 0:
+        pytest.skip('Bootstrap requires root; system-changing commands are stubbed.')
+    project = tmp_path / 'project'; project.mkdir()
+    deploy = project / 'deploy'; deploy.mkdir()
+    (deploy / 'install.sh').write_text('#!/bin/bash\nprintf "%s\\n" "$@" > received-args\n')
+    subprocess.run(['git', 'init', '-q', '-b', 'main', str(project)], check=True)
+    subprocess.run(['git', '-C', str(project), 'remote', 'add', 'origin', 'https://github.com/Darkvampire1998/pars-agent.git'], check=True)
+    subprocess.run(['git', '-C', str(project), 'add', 'deploy'], check=True)
+    subprocess.run(['git', '-C', str(project), '-c', 'user.name=Tester', '-c', 'user.email=test@example.com', 'commit', '-qm', 'fixture'], check=True)
+    (project / '.env').write_text('existing private settings\n')
+    tools_dir = tmp_path / 'tools'; tools_dir.mkdir()
+    real_git = subprocess.check_output(['which', 'git'], text=True).strip()
+    (tools_dir / 'git').write_text(f'#!/bin/sh\ncase "$1" in fetch|merge) exit 0;; esac\nexec "{real_git}" "$@"\n')
+    (tools_dir / 'apt-get').write_text('#!/bin/sh\necho "unexpected apt mutation" >&2\nexit 99\n')
+    (tools_dir / 'docker').write_text('#!/bin/sh\nexit 0\n')
+    for item in tools_dir.iterdir(): item.chmod(0o755)
+    r = subprocess.run(['bash', str(SCRIPT), '--ip', '8.8.8.8', '--dir', str(project)], text=True,
+                       capture_output=True, env={**os.environ, 'PATH': str(tools_dir) + ':' + os.environ['PATH']})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert 'skipping apt' in r.stdout and 'Resuming the existing' in r.stdout
+    assert '--reconfigure' in (project / 'received-args').read_text()
+    assert (project / '.env').read_text() == 'existing private settings\n'

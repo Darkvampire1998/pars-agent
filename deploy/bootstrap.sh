@@ -6,7 +6,7 @@ umask 077
 domain=""
 ip=""
 port="443"
-resume=false
+resume=auto
 install_options=()
 repository="Darkvampire1998/pars-agent"
 install_dir="/opt/pars-agent"
@@ -16,13 +16,14 @@ usage() {
   cat <<'HELP'
 Pars Agent Linux installer
 Usage: sudo bash bootstrap.sh (--domain HOST | --ip PUBLIC_IP) [--port 443]
-       [--resume] [--host-build-network] [--repo owner/repo] [--dir /opt/pars-agent] [--branch main]
+       [--resume] [--source-build|--host-build-network] [--repo owner/repo] [--dir /opt/pars-agent] [--branch main]
 
-Installs Git, Python, curl and (if absent) Docker Engine from Docker's official
-repository on Ubuntu/Debian. Clones the project and starts the HTTPS panel.
+Installs missing dependencies only. Downloads the ready container from GHCR;
+Python packages are already installed in the image. Starts the HTTPS panel.
 Existing unrelated directories are refused. MT5/Wine is configured separately.
---resume recovers a failed installation in a clean checkout, preserving .env.
+Failed installations in clean matching checkouts resume automatically, preserving .env.
 Running installations must be updated with deploy/update.sh.
+--source-build builds locally instead; this needs working PyPI connectivity.
 --host-build-network uses the Linux host network for the build only, if bridge
 DNS is broken. It does not change system DNS or runtime service networking.
 Public IP HTTPS uses a short-lived Let's Encrypt certificate; TCP 80 must be open.
@@ -43,7 +44,7 @@ while [[ $# -gt 0 ]]; do
       esac
       shift 2;;
     --resume) resume=true; shift;;
-    --host-build-network) install_options+=("$1"); shift;;
+    --source-build|--host-build-network) install_options+=("$1"); shift;;
     --help|-h) usage; exit 0;;
     *) fail "Unknown option: $1";;
   esac
@@ -81,11 +82,12 @@ install_options+=(--port "$port")
 [[ "$branch" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || fail "Invalid branch."
 [[ "$install_dir" == /* && "$install_dir" != / && ! "$install_dir" =~ (^|/)\.\.(/|$) ]] || fail "Installation directory must be an absolute path without parent traversal."
 if [[ -e "$install_dir" ]]; then
-  [[ "$resume" == true && ! -L "$install_dir" && -d "$install_dir/.git" ]] || fail "Directory already exists: $install_dir. Use --resume only for a failed Git installation."
+  [[ ! -L "$install_dir" && -d "$install_dir/.git" ]] || fail "Directory already exists: $install_dir. Only a matching Git installation can resume."
   command -v git >/dev/null || fail "Git is required to verify the existing checkout before resuming."
   [[ "$(git -C "$install_dir" remote get-url origin)" == "https://github.com/$repository.git" ]] || fail "Existing checkout has a different origin; resume stopped."
   [[ "$(git -C "$install_dir" branch --show-current)" == "$branch" ]] || fail "Existing checkout uses a different branch."
   [[ -z "$(git -C "$install_dir" status --porcelain --untracked-files=no)" ]] || fail "Tracked files have local changes; resume stopped."
+  resume=true
 elif [[ "$resume" == true ]]; then
   fail "Cannot resume: installation directory does not exist."
 fi
@@ -99,8 +101,17 @@ suite="${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}"
 command -v apt-get >/dev/null || fail "apt-get is required."
 
 printf 'Installing panel dependencies for %s; repository %s.\n' "${domain:-$ip}" "$repository"
-apt-get update
-apt-get install -y ca-certificates curl git python3
+missing=()
+for dependency in curl git python3; do
+  command -v "$dependency" >/dev/null || missing+=("$dependency")
+done
+[[ -s /etc/ssl/certs/ca-certificates.crt ]] || missing+=(ca-certificates)
+if [[ ${#missing[@]} -gt 0 ]]; then
+  apt-get update
+  apt-get install -y "${missing[@]}"
+else
+  printf 'Dependencies already installed; skipping apt update/install.\n'
+fi
 if ! command -v docker >/dev/null; then
   install -d -m 0755 /etc/apt/keyrings
   curl --proto '=https' --tlsv1.2 --fail --silent --show-error "https://download.docker.com/linux/$ID/gpg" -o /etc/apt/keyrings/pars-agent-docker.asc
@@ -132,8 +143,26 @@ if [[ "$resume" == true ]]; then
   cd -- "$install_dir"
   if [[ -f .env ]]; then
     active="$(docker compose ps --status running -q app)" || fail "Cannot check existing services; review them before resuming."
-    [[ -z "$active" ]] || fail "Application is running. Use deploy/update.sh and the documented address migration instead."
+    if [[ -n "$active" ]]; then
+      existing_url="$(python3 - <<'PY'
+from pathlib import Path
+print(next((line.split('=', 1)[1] for line in Path('.env').read_text().splitlines() if line.startswith('PUBLIC_URL=')), ''))
+PY
+)"
+      host="${domain,,}"
+      if [[ -n "$ip" ]]; then
+        host="$(python3 -c 'import ipaddress,sys; a=ipaddress.ip_address(sys.argv[1]); print("["+str(a)+"]" if a.version == 6 else str(a))' "$ip")"
+      fi
+      requested_url="https://$host"
+      [[ "$port" == 443 ]] || requested_url+=":$port"
+      if [[ "$existing_url" == "$requested_url" ]] && curl --proto '=https' --tlsv1.2 --fail --silent --show-error --noproxy '*' --connect-timeout 5 --max-time 10 "$existing_url/api/health" >/dev/null; then
+        printf '\nPanel already responds over verified HTTPS: %s\nManagement: bash %s/deploy/manage.sh\n' "$existing_url" "$PWD"
+        exit 0
+      fi
+      fail 'Application is running; use deploy/manage.sh logs for HTTPS errors, or deploy/update.sh for updates. Address migration must be explicit.'
+    fi
   fi
+  printf 'Resuming the existing clean installation; secrets and data are preserved.\n'
   git fetch origin "$branch"
   git merge --ff-only FETCH_HEAD
   install_options+=(--reconfigure)

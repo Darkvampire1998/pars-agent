@@ -30,8 +30,18 @@ case "$action" in
   update) bash deploy/update.sh;;
   backup) bash deploy/backup.sh;;
   doctor)
-    python3 deploy/check-network.py
-    docker compose exec -T app python - < deploy/check-network.py;;
+    mode="$(python3 - <<'PY'
+from pathlib import Path
+settings = dict(line.split('=', 1) for line in Path('.env').read_text().splitlines() if '=' in line and not line.startswith('#'))
+print('image' if settings.get('COMPOSE_FILE') == 'compose.yaml:deploy/compose.image.yaml' else 'source')
+PY
+)"
+    python3 deploy/check-network.py --mode "$mode"
+    # Copy to /tmp: subprocess probe deadlines need a real file, not stdin.
+    container="$(docker compose ps -q app)"
+    [[ -n "$container" ]] || { printf 'Application is not running.\n' >&2; exit 1; }
+    docker cp deploy/check-network.py "$container:/tmp/pars-agent-network.py"
+    docker compose exec -T app python /tmp/pars-agent-network.py --mode image;;
   address) address;;
   *) printf 'Usage: bash deploy/manage.sh [status|start|stop|restart|logs|update|backup|doctor|address]\n' >&2; exit 2;;
 esac

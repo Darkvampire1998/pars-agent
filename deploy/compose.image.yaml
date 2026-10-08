@@ -1,0 +1,6 @@
+# The ready image includes Python dependencies; no pip/build runs on the VPS.
+services:
+  app:
+    build: !reset null
+    image: ${PARS_AGENT_IMAGE:?Run the installer first}
+    pull_policy: if_not_present

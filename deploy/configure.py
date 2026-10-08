@@ -34,7 +34,12 @@ def endpoint(domain=None, ip=None, local=False, port=443):
             "PUBLIC_URL": url, "COOKIE_SECURE": "true", "CADDY_CONFIG": config}
 
 
-def write_config(path, values, reconfigure=False, host_build=False, reuse=False):
+def write_config(path, values, reconfigure=False, host_build=False, reuse=False,
+                 image=None, source_build=False):
+    if image and (source_build or host_build):
+        raise ValueError("Choose a ready image or a source build, not both.")
+    if image and not re.fullmatch(r"ghcr\.io/[a-z0-9][a-z0-9_.-]*/[a-z0-9][a-z0-9_.-]*(?::git-[0-9a-f]{40}|@sha256:[0-9a-f]{64})", image):
+        raise ValueError("Image must be a GHCR commit tag (git-<40 hex>) or SHA256 digest.")
     existed = path.exists()
     if existed:
         if path.is_symlink() or not path.is_file():
@@ -63,11 +68,17 @@ def write_config(path, values, reconfigure=False, host_build=False, reuse=False)
         current = {"ENCRYPTION_KEY": base64.urlsafe_b64encode(os.urandom(32)).decode(),
                    "REGISTRATION_ENABLED": "true", "LIVE_TRADING_ALLOWED": "false"}
     replacements = dict(values)
-    if host_build:
+    if host_build or image or source_build:
         previous = current.get("COMPOSE_FILE", "compose.yaml")
-        if previous not in ("compose.yaml", "compose.yaml:deploy/compose.host-build.yaml"):
-            raise ValueError("Custom COMPOSE_FILE exists; review it before enabling host build networking.")
-        replacements["COMPOSE_FILE"] = "compose.yaml:deploy/compose.host-build.yaml"
+        if previous not in ("compose.yaml", "compose.yaml:deploy/compose.host-build.yaml",
+                            "compose.yaml:deploy/compose.image.yaml"):
+            raise ValueError("Custom COMPOSE_FILE exists; review it before changing installation mode.")
+        if image:
+            replacements.update(COMPOSE_FILE="compose.yaml:deploy/compose.image.yaml",
+                                PARS_AGENT_IMAGE=image)
+        else:
+            replacements["COMPOSE_FILE"] = "compose.yaml:deploy/compose.host-build.yaml" if host_build else "compose.yaml"
+            replacements["PARS_AGENT_IMAGE"] = ""
     lines = []
     for line in original.splitlines():
         name = line.split("=", 1)[0] if "=" in line and not line.startswith("#") else None
@@ -104,11 +115,14 @@ def main():
     parser.add_argument("--reconfigure", action="store_true")
     parser.add_argument("--reuse", action="store_true", help="Reuse only an identical existing public URL.")
     parser.add_argument("--host-build-network", action="store_true")
+    parser.add_argument("--source-build", action="store_true")
+    parser.add_argument("--image", help="Ready GHCR image, pinned to a commit tag or digest.")
     args = parser.parse_args()
     try:
         values = endpoint(args.domain, args.ip, args.local, args.port)
         write_config(Path(__file__).resolve().parent.parent / ".env", values,
-                     args.reconfigure, args.host_build_network, args.reuse)
+                     args.reconfigure, args.host_build_network, args.reuse,
+                     args.image, args.source_build)
     except ValueError as exc:
         parser.exit(2, str(exc) + "\n")
     print("Configuration ready. Encryption key preserved on reconfiguration. Panel URL: " + values["PUBLIC_URL"])

@@ -40,3 +40,14 @@ The source implements these paths where described in README; unexecuted integrat
 - Image/source configuration, optional network failures, stalled DNS, image revision mismatch, download failures and HTTPS failure paths are covered by deployment tests.
 - CI additionally validates that the ready-image Compose configuration has no build declaration and publishes amd64/arm64 images only after the test job succeeds.
 - VPS deployment, certificate issuance on the user's IP, MetaEditor compilation and broker execution remain unverified.
+
+## Account connector and decision upgrade — 2026-10-08
+
+- Automatic public IPv4 detection rejects nonpublic/invalid responses and requires corroborated external responses or one unambiguous local public address. Explicit IP/domain override remains.
+- Password connection encrypts credentials, scopes retrieval to one account/instance, rotates previous bridge keys on replacement, omits request inputs from validation errors, and reports connection state separately from credential storage.
+- Terminal menu and panel both configure MT5 credentials. The connector uses the official Windows SDK; Docker bundles CPython 3.12 x64 SDK/NumPy wheels for offline dependency installation. Native Linux Python cannot load this SDK.
+- Five strategy rules, adaptive/consensus/priority decisions, position/currency direction checks, daily entry cap, cooldown, consecutive losing-exit control and latched daily/total safety stops are covered by upgrade tests. Legacy configurations remain under their existing choices.
+- Chronological evaluation uses next-open entry, SL priority for ambiguous bars, costs, a 30% final holdout and doubled-cost stress. It does not optimize parameters, compute DSR/PBO or reproduce broker tick execution. No strategy profitability on real broker data is asserted.
+- Synthetic SDK tests exercise complete login/snapshot/claim/result flow, independent execution checks and no broker retry after timeout/unknown state. Synthetic historical prices test arithmetic/causality, not investment performance.
+- GitHub Actions additionally checks SDK import on Windows x64 and PowerShell setup syntax, Linux configuration/builds and published image health/offline wheel inclusion.
+- Actual broker login, broker order execution, MetaEditor compilation, Wine runtime preparation and the upgraded version on the user's VPS remain unverified.

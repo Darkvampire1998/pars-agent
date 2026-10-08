@@ -4,6 +4,8 @@ const $$ = s => [...document.querySelectorAll(s)];
 let csrf='', me=null, accounts=[], aid='', data=null, symbol='', activeTab='overview', registerMode=false, refreshing=false;
 let toastTimer;
 const titles={overview:['MARKET OVERVIEW','بازار، زیر نگاه تو.'],strategies:['STRATEGY ENGINE','قواعد معامله در دست تو.'],risk:['RISK CONTROL','هر ورود، با مرز مشخص.'],connection:['ACCOUNT CONNECTION','یک پل تا متاتریدر.'],telegram:['TELEGRAM REPORTS','گزارش‌ها، همیشه همراهت.'],reports:['EXECUTION REPORTS','هر معامله، قابل پیگیری.'],logs:['ACTIVITY LOG','رویدادهای اتاق معاملات.']};
+titles.evaluation=['STRATEGY EVALUATION','هر راهبرد، با شواهد واقعی.'];
+const controlDefaults={decision_policy:'priority',min_votes:2,cooldown_seconds:0,max_daily_entries:0,max_losing_exits:0,max_spread_atr:1,risk_day_offset_minutes:0,volatility_filter:false,one_position_per_symbol:false,block_shared_currency:false};
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const num=(v,d=2)=>Number.isFinite(Number(v))?Number(v).toLocaleString('en-US',{maximumFractionDigits:d}):'—';
 const date=v=>v?new Date(v*1000).toLocaleString('fa-IR',{dateStyle:'short',timeStyle:'short'}):'—';
@@ -21,7 +23,7 @@ async function api(path,method='GET',body){
 }
 function requireAccount(){if(!aid)throw new Error('ابتدا یک حساب در بخش حساب و اتصال بساز.');if(data?.account?.id!==aid)throw new Error('در حال دریافت اطلاعات این حساب؛ چند لحظه صبر کن.');}
 function account(){return data?.account?.id===aid?data.account:accounts.find(x=>x.id===aid);}
-function showKey(key){$('#key-value').value=key;$('#key-dialog').showModal();}
+function showKey(key,id=aid){$('#key-value').value=key;$('#key-account-id').textContent='Account ID: '+id;$('#key-dialog').showModal();}
 async function boot(){
   me=await api('/me');csrf=me.csrf;$('#user-email').textContent=me.email;
   $('#auth').hidden=true;$('#workspace').hidden=false;
@@ -48,11 +50,20 @@ function switchTab(name){
 function fillForms(){
   const c=account()?.config;if(!c)return;
   for(const field of ['risk_pct','max_open_risk_pct','daily_loss_pct','total_loss_pct','max_positions','max_spread_points','max_deviation_points','cost_buffer_pct'])$('#risk-form [name='+field+']').value=c[field];
+  for(const field of Object.keys(controlDefaults)){
+    const input=$('#risk-form [name='+field+']'),value=c[field]??controlDefaults[field];
+    if(input.type==='checkbox')input.checked=!!value;else input.value=value;
+  }
   $('#symbols').value=c.symbols.join(',');$('#timeframe').value=c.timeframe;$('#rr').value=c.rr;$('#mode').value=c.mode;
   $$('#strategy-cards input').forEach(x=>x.checked=c.strategies.includes(x.value));
 }
 function render(){
   const a=account(),s=a?.snapshot,c=a?.config;
+  $('#decision-reason').textContent=data?.safety_halt||data?.decision?.reason||'منتظر دریافت کندل از ترمینال';
+  $('#decision-context').textContent=data?.decision?`${data.decision.regime} · ADX ${num(data.decision.adx,1)} · ${date(data.decision.updated)}`:'';
+  $('#mt5-account-id').textContent=a?`Account ID: ${a.id} | ${a.login} | ${a.server||''}`:'ابتدا حساب بساز یا انتخاب کن.';
+  const states={waiting:'رمز ذخیره شده؛ منتظر اجرای کانکتور',connecting:'در حال ورود به متاتریدر',connected:'ورود کانکتور موفق؛ داده ترمینال را بررسی کن',login_failed:'ورود ناموفق؛ رمز و نام دقیق سرور را بررسی کن',disconnected:'کانکتور قطع است',permissions_blocked:'ورود انجام شده؛ معامله خودکار در ترمینال/حساب مجاز نیست',data_unavailable:'کندل یا داده حساب هنوز آماده نیست',mql5:'اتصال با اکسپرت؛ رمز در ترمینال نگهداری می‌شود'};
+  $('#mt5-connection-state').textContent=states[data?.connection?.status]||'منتظر کانکتور';
   $('#connection-status').innerHTML=`<i class="dot ${a?.connected?'':'gray'}"></i>${a?.connected?'ترمینال متصل':'ترمینال متصل نیست'}`;
   $('#agent-status').textContent=c?.running?'ایجنت فعال':'ایجنت متوقف';
   $('#mode-badge').textContent=({signals:'فقط تحلیل',demo:'معامله دمو',live:'معامله واقعی'})[c?.mode]||'فقط تحلیل';
@@ -68,7 +79,7 @@ function render(){
   $('#chart-timeframe').textContent=c?.timeframe||'M5';$('#chart-empty').hidden=!!market;
   $('#chart-count').textContent=(market?.bars.length||0)+' کندل';drawChart(market?.bars||[]);
   const ideas=(data?.ideas||[]).filter(x=>x.symbol===symbol&&x.timeframe===c?.timeframe);
-  $('#market-state').textContent=market&&Date.now()/1000-market.received_at>20?'داده قدیمی':({range:'بازار رنج',trend:'بازار رونددار',unknown:'نامشخص'})[ideas[0]?.regime]||'داده موجود نیست';
+  $('#market-state').textContent=market&&Date.now()/1000-market.received_at>20?'داده قدیمی':({range:'بازار رنج',trend:'بازار رونددار',transition:'بازار در حال تغییر',unknown:'نامشخص'})[ideas[0]?.regime]||'داده موجود نیست';
   $('#ideas').innerHTML=ideas.slice(0,9).map(x=>`<article class="idea"><div class="idea-head"><span>${esc(x.symbol)} · ${esc(x.timeframe)}</span><b class="side ${esc(x.side)}">${esc(x.side)}</b></div><h3>${esc(me?.strategies[x.strategy]?.name||x.strategy)}</h3><p>${esc(x.reason)}</p>${x.side!=='WAIT'?`<div class="levels"><div><span>ENTRY</span>${num(x.entry,5)}</div><div><span>STOP</span>${num(x.sl,5)}</div><div><span>TARGET</span>${num(x.tp,5)}</div></div>`:''}<div class="idea-meta">${date(x.created)} · RSI ${num(x.rsi,1)}</div></article>`).join('')||'<div class="empty">پس از اتصال ترمینال، تحلیل همین‌جا ظاهر می‌شود.</div>';
   $('#orders-list').innerHTML=(data?.orders||[]).map(o=>`<div class="order-row"><b>${esc(o.data.symbol)} · ${esc(o.data.side)}</b><span class="badge">${esc(o.status)}</span><span>${date(o.created)}</span><code dir="ltr">${esc(o.id)}</code><small>${esc(o.result?.reason||'')}</small></div>`).join('')||'<p class="muted">هنوز سفارشی ثبت نشده است.</p>';
   $('#audit-list').innerHTML=(data?.audit||[]).map(x=>`<div class="audit-row"><span dir="ltr">${esc(x.event)}</span><span>${date(x.created)}</span></div>`).join('')||'<p class="muted">رویدادی ثبت نشده است.</p>';
@@ -104,9 +115,24 @@ $('#logout').addEventListener('click',action(async()=>{await api('/logout','POST
 $('#toggle-agent').addEventListener('click',action(async()=>{requireAccount();if(account().config.running){await api(`/accounts/${aid}/stop`,'POST',{});await refreshAccounts();toast('ورود جدید متوقف شد.');}else{await saveConfig({running:true});}}));
 $('#stop-agent').addEventListener('click',action(async()=>{requireAccount();await api(`/accounts/${aid}/stop`,'POST',{});await refreshAccounts();toast('ورود جدید متوقف شد. حد ضرر و هدف پوزیشن‌های باز باقی می‌مانند.');}));
 $('#strategy-form').addEventListener('submit',action(async e=>{e.preventDefault();const fd=new FormData(e.target);await saveConfig({strategies:fd.getAll('strategies'),symbols:fd.get('symbols').split(',').map(x=>x.trim()).filter(Boolean),timeframe:fd.get('timeframe'),mode:fd.get('mode'),rr:Number(fd.get('rr'))});}));
-$('#risk-form').addEventListener('submit',action(async e=>{e.preventDefault();const v=Object.fromEntries([...new FormData(e.target)].map(([k,v])=>[k,Number(v)]));await saveConfig(v);}));
+$('#risk-form').addEventListener('submit',action(async e=>{e.preventDefault();const fd=new FormData(e.target),v=Object.fromEntries([...fd].filter(([k])=>!['decision_policy','volatility_filter','one_position_per_symbol','block_shared_currency'].includes(k)).map(([k,v])=>[k,Number(v)]));v.decision_policy=fd.get('decision_policy');for(const k of ['volatility_filter','one_position_per_symbol','block_shared_currency'])v[k]=fd.has(k);await saveConfig(v);}));
 $('#account-form').addEventListener('submit',action(async e=>{e.preventDefault();const v=Object.fromEntries(new FormData(e.target));v.initial_equity=Number(v.initial_equity);const result=await api('/accounts','POST',v);aid=result.id;await refreshAccounts();e.target.reset();showKey(result.bridge_key);}));
 $('#rotate-key').addEventListener('click',action(async()=>{requireAccount();const r=await api(`/accounts/${aid}/rotate-key`,'POST',{});await refreshAccounts();showKey(r.bridge_key);}));
+$('#connection-form').addEventListener('submit',action(async e=>{e.preventDefault();requireAccount();const selected=aid,password=e.target.elements.password.value;const result=await api(`/accounts/${selected}/connection`,'PUT',{password});e.target.reset();await refreshAccounts();showKey(result.bridge_key,selected);}));
+for(const profile of ['conservative','balanced'])$('#profile-'+profile).addEventListener('click',action(async()=>{if(!me?.profiles?.[profile])throw new Error('پروفایل از سرور دریافت نشده است');await saveConfig({...me.profiles[profile],running:false});}));
+$('#reset-safety').addEventListener('click',action(async()=>{requireAccount();await api(`/accounts/${aid}/reset-safety`,'POST',{});await refreshAccounts();toast('توقف حفاظتی رفع شد؛ شروع ایجنت باید جدا انجام شود.');}));
+$('#evaluation-form').addEventListener('submit',action(async e=>{
+  e.preventDefault();requireAccount();const file=$('#evaluation-file').files[0];if(!file)throw new Error('فایل CSV لازم است');if(file.size>1024*1024)throw new Error('حداکثر حجم فایل ۱ مگابایت است');
+  const lines=(await file.text()).trim().replace(/^\uFEFF/,'').split(/\r?\n/),headers=lines.shift().split(',').map(x=>x.trim().toLowerCase());
+  if(!['time','open','high','low','close'].every(k=>headers.includes(k)))throw new Error('ستون‌های time,open,high,low,close لازم است');
+  const bars=lines.filter(x=>x.trim()).map(line=>{const cells=line.split(',');return Object.fromEntries(['time','open','high','low','close'].map(k=>[k,Number(cells[headers.indexOf(k)])]));});
+  const values=Object.fromEntries([...new FormData(e.target)].map(([k,v])=>[k,Number(v)])),c=account().config;
+  const button=$('#evaluate-submit');button.disabled=true;
+  try{const result=await api(`/accounts/${aid}/evaluate`,'POST',{...values,bars,strategies:c.strategies,policy:c.decision_policy||'priority',min_votes:c.min_votes||2,rr:c.rr,risk_pct:c.risk_pct});
+    const names={development:'بخش توسعه',holdout:'۳۰٪ آخر مستقل',cost_stress:'هزینه دوبرابر در بخش آخر'};
+    $('#evaluation-result').innerHTML=`<p class="notice">${esc(result.note)}</p><table><thead><tr><th>بخش</th><th>معامله</th><th>برد %</th><th>امید R</th><th>ضریب سود</th><th>بازده %</th><th>افت %</th></tr></thead><tbody>${Object.entries(names).map(([key,title])=>{const r=result[key];return `<tr><td>${title}</td><td>${r.trades}</td><td>${r.win_rate_pct===null?'—':num(r.win_rate_pct)}</td><td>${r.expectancy_r===null?'—':num(r.expectancy_r,4)}</td><td>${r.profit_factor===null?'—':num(r.profit_factor,3)}</td><td>${num(r.return_pct,3)}</td><td>${num(r.max_drawdown_pct,3)}</td></tr>`;}).join('')}</tbody></table><p>${esc(({insufficient:'تعداد معاملات برای نتیجه‌گیری کافی نیست.',unfavorable:'نتیجه بخش آخر یا آزمون هزینه مناسب نیست.',needs_demo_validation:'این نتیجه هنوز به آزمون دمو و داده مستقل تازه نیاز دارد.'})[result.assessment])}</p>`;
+  }finally{button.disabled=false;}
+}));
 $('#close-key').addEventListener('click',()=>{$('#key-dialog').close();$('#key-value').value='';});
 $('#key-dialog').addEventListener('cancel',()=>{$('#key-value').value='';});
 $('#copy-key').addEventListener('click',action(async()=>{await navigator.clipboard.writeText($('#key-value').value);toast('کلید کپی شد.');}));

@@ -1,5 +1,5 @@
 #property strict
-#property version "0.10"
+#property version "0.30"
 #property description "Pars Agent MT5 bridge. Attach ONE copy per account. HTTPS only."
 #include <Trade/Trade.mqh>
 
@@ -84,6 +84,15 @@ ENUM_TIMEFRAMES Frame(string s) {
    if(s=="H1") return PERIOD_H1;
    return PERIOD_M5;
 }
+string PositionsJson() {
+   string out="";
+   for(int i=0;i<PositionsTotal();i++) {
+      if(PositionGetTicket(i)==0) return "null";
+      if(i>0) out+=",";
+      out+="{\"symbol\":"+Q(PositionGetString(POSITION_SYMBOL))+",\"side\":"+Q(PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY ? "BUY" : "SELL")+"}";
+   }
+   return "["+out+"]";
+}
 string Deals() {
    string out=""; int added=0;
    if(!HistorySelect(TimeCurrent()-7*86400,TimeCurrent())) return "[]";
@@ -127,7 +136,7 @@ string Snapshot(string symbol,string tf) {
       +",\"point\":"+Num(SymbolInfoDouble(symbol,SYMBOL_POINT))+",\"digits\":"+(string)SymbolInfoInteger(symbol,SYMBOL_DIGITS)
       +",\"stops_level\":"+(string)SymbolInfoInteger(symbol,SYMBOL_TRADE_STOPS_LEVEL)+",\"open_risk\":"+Num(risk)
       +",\"positions_count\":"+(string)PositionsTotal()+",\"unprotected_positions\":"+(string)unsafe+",\"pending_orders\":"+(string)OrdersTotal()
-      +",\"bars\":["+candles+"],\"deals\":"+Deals()+"}";
+      +",\"bars\":["+candles+"],\"deals\":"+Deals()+",\"positions\":"+PositionsJson()+"}";
 }
 bool PersistResult(string value) {
    int file=FileOpen(journal_file,FILE_WRITE|FILE_TXT|FILE_ANSI,0,CP_UTF8);
@@ -161,6 +170,10 @@ void Execute(string o) {
    if(TimeTradeServer()-tick.time>15) { Report(id,"rejected","Stale quote"); return; }
    int unsafe=0; double open_risk=OpenRisk(unsafe);
    if(unsafe>0 || OrdersTotal()>0 || PositionsTotal()>=JNum(o,"max_positions")) { Report(id,"rejected","Open position or pending-order risk blocked"); return; }
+   for(int p=0;p<PositionsTotal();p++) {
+      if(PositionGetTicket(p)==0) { Report(id,"rejected","Position state unavailable"); return; }
+      if(JNum(o,"one_position_per_symbol")>0 && PositionGetString(POSITION_SYMBOL)==symbol) { Report(id,"rejected","Symbol position already open"); return; }
+   }
    double equity=AccountInfoDouble(ACCOUNT_EQUITY);
    bool buy=side=="BUY"; double entry=buy ? tick.ask : tick.bid;
    double deviation=JNum(o,"max_deviation_points");

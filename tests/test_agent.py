@@ -8,7 +8,7 @@ from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 
 from app.db import transaction
-from app.main import app
+from app.main import app, Config
 from app.risk import gate
 from app.strategies import analyze
 
@@ -36,6 +36,9 @@ def new_account(client, h, login="12345"):
     r = client.post("/api/accounts", headers=h, json={"name": "Demo", "login": login, "server": "Broker-Demo", "initial_equity": 10000})
     assert r.status_code == 200, r.text
     v = r.json()
+    # Existing protocol fixtures exercise legacy M5/priority admission. New-account
+    # conservative defaults and adaptive filters have separate tests below.
+    assert client.put(f"/api/accounts/{v['id']}/config",headers=h,json=Config().model_dump()).status_code==200
     return v["id"], {"Authorization": "Bearer " + v["bridge_key"]}
 
 def snapshot():
